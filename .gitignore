@@ -1,0 +1,8 @@
+*.xcodeproj/
+App/Support/Info.plist
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+.DS_Store
+_transfer/

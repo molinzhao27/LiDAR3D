@@ -1,0 +1,50 @@
+# XcodeGen spec. Run `xcodegen generate` in this folder to create Facet3D.xcodeproj.
+name: Facet3D
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+packages:
+  ScanCore:
+    path: ScanCore
+targets:
+  Facet3D:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: App
+    dependencies:
+      - package: ScanCore
+      - sdk: ARKit.framework
+      - sdk: RealityKit.framework
+      - sdk: SceneKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Network.framework
+    info:
+      path: App/Support/Info.plist
+      properties:
+        CFBundleDisplayName: Facet
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arkit]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UISupportedInterfaceOrientations~ipad:
+          [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown]
+        UIRequiresFullScreen: true
+        NSCameraUsageDescription: Facet uses the LiDAR or TrueDepth camera to capture 3D scans. Everything stays on this device.
+        NSLocalNetworkUsageDescription: Facet serves your scans to computers on the same Wi-Fi network when you turn on Wi-Fi sharing.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.molinzhao.lidar3d
+        DEVELOPMENT_TEAM: HQS722KV3Q
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_PREVIEWS: YES
