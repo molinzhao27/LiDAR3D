@@ -11,7 +11,7 @@ UI from Heges were used.
 
 | | |
 |---|---|
-| **LiDAR scan** (rear camera, Pro iPhones and iPads) | Walk around an object, person, car or room. ARKit tracks the phone and reconstructs a mesh; Facet fuses every LiDAR depth frame into a coloured voxel cloud alongside it. A distance limit crops the background. |
+| **LiDAR scan** (rear camera, Pro iPhones and iPads) | Walk around an object, person, car or room. ARKit tracks the phone; Facet fuses the LiDAR depth frames into a signed distance volume (down to 5 mm detail) for the mesh and into a coloured voxel cloud for the points. A distance limit crops the background. |
 | **TrueDepth scan** (front FaceID camera) | Faces and small close-up objects. The subject holds still for about a second; 30 depth frames are averaged to cut noise, then meshed and coloured from the video frame. |
 | **3D viewer** | Orbit, zoom and pan. Switch between mesh and point cloud, captured colour or shaded surface. |
 | **AR viewer** | Place the scan on a real surface at true scale, pinch to scale, twist to rotate. |
@@ -57,6 +57,7 @@ App/
 ScanCore/                         Pure Swift, no Apple frameworks, unit-tested
   Geometry.swift                  Intrinsics, back-projection, rigid transforms
   Depth.swift                     Depth map → mesh, multi-frame depth averaging
+  TSDF.swift                      Signed distance fusion, surface-nets mesh extraction
   VoxelCloud.swift                Sparse voxel fusion, mesh colouring and cropping
   Mesh.swift                      Indexed mesh, normals, filtering, small-piece removal
   PLY.swift, STL.swift            Readers and writers
@@ -65,11 +66,15 @@ ScanCore/                         Pure Swift, no Apple frameworks, unit-tested
 
 **LiDAR pipeline.** About six times a second, the scene depth map (256×192) is
 back-projected with the camera intrinsics, moved into world space with ARKit's
-camera pose, and added to a sparse voxel grid (1 cm by default) that averages
-position and colour per voxel. When you press Done, ARKit's reconstructed mesh
-is coloured from the nearest voxel, any part never seen within the distance
-limit is cut away, and tiny floating pieces are removed. The voxel cloud itself
-is saved as the point cloud.
+camera pose, and added to a sparse voxel grid (5 mm by default) that averages
+position and colour per voxel; this is saved as the point cloud. Pixels on
+silhouette edges, where the sensor blends foreground and background, are
+skipped. The same frames are fused into a truncated signed distance volume
+(sparse 8×8×8 blocks of voxels, each averaging its distance to the surface and
+its colour over many frames). When you press Done, the surface is extracted
+with surface nets, giving a smooth mesh at the voxel size, and tiny floating
+pieces are removed. If fusion found no surface, ARKit's own coarser mesh is
+coloured from the voxel cloud and used instead.
 
 **TrueDepth pipeline.** Depth and video are synchronised, depth is averaged per
 pixel over 30 frames with outlier rejection, and neighbouring pixels are joined
@@ -86,5 +91,6 @@ into triangles except across depth jumps (edges of the head, background).
 - The upright orientation of TrueDepth scans uses a fixed rotation
   (`TrueDepthScanner.portraitCorrection`); if scans appear on their side, adjust
   that one constant.
-- LiDAR mesh detail is ARKit's (a few centimetres). The point cloud is denser.
+- LiDAR scans assume the subject holds still. Movement (or tracking drift) during a
+  scan leaves a doubled "ghost" surface; there is no frame-to-frame alignment yet.
 - No texture maps (UV-mapped images); colour is per vertex, like coloured PLY.

@@ -51,12 +51,20 @@ public struct VoxelCloud {
         public var maxDepth: Float = 3
         /// Confidence values below this are skipped (ARKit: 0 low, 1 medium, 2 high).
         public var minConfidence: UInt8 = 1
+        /// Pixels whose depth differs from a direct neighbour by more than this
+        /// fraction of their own depth are skipped. Depth sensors blend the
+        /// foreground and background along silhouettes, and those "flying
+        /// pixels" otherwise show up as streaks and curtains hanging off the
+        /// subject. nil keeps every pixel.
+        public var maxNeighborJump: Float?
 
-        public init(step: Int = 2, minDepth: Float = 0.1, maxDepth: Float = 3, minConfidence: UInt8 = 1) {
+        public init(step: Int = 2, minDepth: Float = 0.1, maxDepth: Float = 3, minConfidence: UInt8 = 1,
+                    maxNeighborJump: Float? = nil) {
             self.step = step
             self.minDepth = minDepth
             self.maxDepth = maxDepth
             self.minConfidence = minConfidence
+            self.maxNeighborJump = maxNeighborJump
         }
     }
 
@@ -79,6 +87,7 @@ public struct VoxelCloud {
                 let z = image.depth[i]
                 guard DepthImage.isValid(z), z >= options.minDepth, z <= options.maxDepth else { continue }
                 if let confidence, confidence[i] < options.minConfidence { continue }
+                if let jump = options.maxNeighborJump, image.isOnEdge(x: x, y: y, relativeJump: jump) { continue }
                 let local = intrinsics.unproject(u: Float(x), v: Float(y), depth: z)
                 add(cameraToWorld.apply(local), color: color(x, y))
                 added += 1
@@ -106,40 +115,38 @@ public struct VoxelCloud {
     /// Colour of the observed point closest to `p` within `searchRadius`
     /// voxels in each direction, or nil when nothing was observed nearby.
     public func color(near p: SIMD3<Float>, searchRadius: Int = 1) -> SIMD3<UInt8>? {
-        guard p.x.isFinite, p.y.isFinite, p.z.isFinite else { return nil }
-        let k = key(for: p)
-        let r = Int32(max(0, searchRadius))
-        var best = -1
-        var bestDistance = Float.greatestFiniteMagnitude
-        for dz in -r...r {
-            for dy in -r...r {
-                for dx in -r...r {
-                    guard let i = lookup[k &+ SIMD3(dx, dy, dz)] else { continue }
-                    let d = positionSums[i] / Float(counts[i]) - p
-                    let dist = (d * d).sum()
-                    if dist < bestDistance {
-                        bestDistance = dist
-                        best = i
-                    }
-                }
-            }
-        }
-        guard best >= 0 else { return nil }
-        let c = colorSums[best] / Float(counts[best])
-        return SIMD3(UInt8(min(255, c.x.rounded())), UInt8(min(255, c.y.rounded())), UInt8(min(255, c.z.rounded())))
+        guard let hit = nearestVoxel(to: p, maxRadius: max(0, searchRadius)) else { return nil }
+        return averageColor(hit.index)
     }
 
-    /// Colours every vertex of `mesh` from the cloud. Vertices with no observed
-    /// point nearby are removed along with their triangles, which trims the
-    /// mesh to what the depth camera actually saw within range.
-    public func colorizeAndCrop(_ mesh: Mesh, searchRadius: Int = 2) -> Mesh {
+    /// Colours every vertex of `mesh` from the nearest observed point. Vertices
+    /// with no observed point within `maxDistance` metres (default: two voxels)
+    /// are removed along with their triangles, which trims the mesh to what the
+    /// depth camera actually saw within range. The reach is in metres so the
+    /// crop doesn't tighten when the voxels are made finer.
+    public func colorizeAndCrop(_ mesh: Mesh, maxDistance: Float? = nil) -> Mesh {
+        let reach = max(maxDistance ?? 2 * voxelSize, voxelSize)
+        let radius = Int((reach / voxelSize).rounded(.up))
+
+        // One coarse cell per `reach`: a vertex with no occupied cell around it
+        // is out of range, found with 27 lookups instead of a full voxel search.
+        // Most of ARKit's mesh (walls, floor, far furniture) is rejected here.
+        var occupied = Set<SIMD3<Int32>>()
+        occupied.reserveCapacity(counts.count)
+        for i in 0..<counts.count {
+            occupied.insert(Self.cell(of: positionSums[i] / Float(counts[i]), size: reach))
+        }
+
         var colored = mesh
         colored.colors = []
         colored.colors.reserveCapacity(mesh.vertexCount)
         var keep = [Bool](repeating: true, count: mesh.vertexCount)
         for i in 0..<mesh.vertexCount {
-            if let c = color(near: mesh.positions[i], searchRadius: searchRadius) {
-                colored.colors.append(c)
+            let p = mesh.positions[i]
+            if Self.hasNeighbor(of: Self.cell(of: p, size: reach), in: occupied),
+               let hit = nearestVoxel(to: p, maxRadius: radius),
+               hit.distanceSquared <= reach * reach {
+                colored.colors.append(averageColor(hit.index))
             } else {
                 colored.colors.append(SIMD3(128, 128, 128))
                 keep[i] = false
@@ -148,5 +155,62 @@ public struct VoxelCloud {
         let cropped = colored.filteringVertices(keep: keep)
         if !mesh.isPointCloud && cropped.indices.isEmpty { return Mesh() }
         return cropped.removingUnreferencedVertices()
+    }
+
+    /// The observed voxel whose mean position is nearest to `p`, searching
+    /// shells of voxels outwards from `p`'s own and stopping one shell after
+    /// the first hit (close enough for colouring and cropping).
+    func nearestVoxel(to p: SIMD3<Float>, maxRadius: Int) -> (index: Int, distanceSquared: Float)? {
+        guard p.x.isFinite, p.y.isFinite, p.z.isFinite,
+              abs(p.x) < 10_000, abs(p.y) < 10_000, abs(p.z) < 10_000 else { return nil }
+        let k = key(for: p)
+        var best = -1
+        var bestDistance = Float.greatestFiniteMagnitude
+        var lastShell = maxRadius
+        var r: Int32 = 0
+        while r <= Int32(lastShell) {
+            for dz in -r...r {
+                for dy in -r...r {
+                    // Inside the shell only its two x faces need checking.
+                    let onFace = abs(dz) == r || abs(dy) == r
+                    var dx = -r
+                    while dx <= r {
+                        if let i = lookup[k &+ SIMD3(dx, dy, dz)] {
+                            let d = positionSums[i] / Float(counts[i]) - p
+                            let dist = (d * d).sum()
+                            if dist < bestDistance {
+                                bestDistance = dist
+                                best = i
+                            }
+                        }
+                        dx = onFace || dx == r ? dx + 1 : r
+                    }
+                }
+            }
+            if best >= 0 { lastShell = min(lastShell, Int(r) + 1) }
+            r += 1
+        }
+        return best >= 0 ? (best, bestDistance) : nil
+    }
+
+    private func averageColor(_ i: Int) -> SIMD3<UInt8> {
+        let c = colorSums[i] / Float(counts[i])
+        return SIMD3(UInt8(min(255, c.x.rounded())), UInt8(min(255, c.y.rounded())), UInt8(min(255, c.z.rounded())))
+    }
+
+    private static func cell(of p: SIMD3<Float>, size: Float) -> SIMD3<Int32> {
+        let s = p / size
+        return SIMD3(Int32(s.x.rounded(.down)), Int32(s.y.rounded(.down)), Int32(s.z.rounded(.down)))
+    }
+
+    private static func hasNeighbor(of c: SIMD3<Int32>, in occupied: Set<SIMD3<Int32>>) -> Bool {
+        for dz: Int32 in -1...1 {
+            for dy: Int32 in -1...1 {
+                for dx: Int32 in -1...1 where occupied.contains(c &+ SIMD3(dx, dy, dz)) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }

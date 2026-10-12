@@ -224,6 +224,120 @@ final class VoxelCloudTests: XCTestCase {
         XCTAssertEqual(result.triangleCount, 1)
         XCTAssertEqual(result.colors, Array(repeating: SIMD3(10, 20, 30), count: 3))
     }
+
+    func testCropReachIsMetricNotVoxels() {
+        // A mesh lying 2 cm off the observed surface, as ARKit's mesh often does.
+        var cloud = VoxelCloud(voxelSize: 0.005)
+        for x in 0..<20 {
+            for y in 0..<20 { cloud.add(SIMD3(Float(x) * 0.005, Float(y) * 0.005, 0), color: SIMD3(9, 9, 9)) }
+        }
+        let mesh = Mesh(positions: [SIMD3(0.02, 0.02, 0.02), SIMD3(0.06, 0.02, 0.02), SIMD3(0.02, 0.06, 0.02)],
+                        indices: [0, 1, 2])
+        XCTAssertEqual(cloud.colorizeAndCrop(mesh, maxDistance: 0.03).triangleCount, 1)
+        XCTAssertEqual(cloud.colorizeAndCrop(mesh, maxDistance: 0.01).triangleCount, 0)
+    }
+
+    func testNearestVoxelFindsClosestPoint() {
+        var cloud = VoxelCloud(voxelSize: 0.01)
+        cloud.add(SIMD3(0.05, 0, 0), color: SIMD3(1, 0, 0))
+        cloud.add(SIMD3(-0.03, 0, 0), color: SIMD3(0, 2, 0))
+        XCTAssertEqual(cloud.color(near: .zero, searchRadius: 6), SIMD3(0, 2, 0))
+        XCTAssertNil(cloud.color(near: .zero, searchRadius: 2))
+    }
+
+    func testIntegrateSkipsFlyingPixels() {
+        // A step from 1 m to 2 m: the two pixels either side of it are dropped.
+        let image = DepthImage(width: 4, height: 1, depth: [1, 1, 2, 2])
+        func integrate(_ jump: Float?) -> Int {
+            var cloud = VoxelCloud(voxelSize: 0.01)
+            return cloud.integrate(depth: image, intrinsics: Intrinsics(fx: 1, fy: 1, cx: 0, cy: 0),
+                                   cameraToWorld: .identity, options: .init(step: 1, maxNeighborJump: jump),
+                                   color: { _, _ in .zero })
+        }
+        XCTAssertEqual(integrate(nil), 4)
+        XCTAssertEqual(integrate(0.05), 2)
+    }
+}
+
+final class TSDFTests: XCTestCase {
+    /// Depth map of a sphere `distance` straight ahead of a camera looking down -z.
+    private func sphereDepth(radius: Float, distance: Float, size: Int, intrinsics k: Intrinsics) -> DepthImage {
+        var depth = [Float](repeating: 0, count: size * size)
+        for v in 0..<size {
+            for u in 0..<size {
+                let ray = SIMD3<Float>((Float(u) - k.cx) / k.fx, -(Float(v) - k.cy) / k.fy, -1)
+                let a = (ray * ray).sum()
+                let disc = distance * distance - a * (distance * distance - radius * radius)
+                guard disc >= 0 else { continue }
+                depth[v * size + u] = (distance - disc.squareRoot()) / a
+            }
+        }
+        return DepthImage(width: size, height: size, depth: depth)
+    }
+
+    func testRigidInverseUndoesTransform() {
+        var m = RigidTransform.rotationZ(0.7)
+        m.c3 = SIMD4(1, 2, 3, 1)
+        let p = SIMD3<Float>(0.3, -0.2, 0.5)
+        let q = m.inverse.apply(m.apply(p))
+        XCTAssertEqual(q.x, p.x, accuracy: 1e-5)
+        XCTAssertEqual(q.y, p.y, accuracy: 1e-5)
+        XCTAssertEqual(q.z, p.z, accuracy: 1e-5)
+    }
+
+    func testFusedPlaneLiesOnSurfaceAndFacesCamera() {
+        let k = Intrinsics(fx: 40, fy: 40, cx: 20, cy: 20)
+        let image = DepthImage(width: 40, height: 40, depth: [Float](repeating: 0.5, count: 1600))
+        var volume = TSDFVolume(voxelSize: 0.01, truncation: 0.04)
+        for _ in 0..<3 {
+            volume.integrate(depth: image, intrinsics: k, cameraToWorld: .identity,
+                             options: .init(step: 1), color: { _, _ in SIMD3(200, 100, 50) })
+        }
+        let mesh = volume.extractMesh(minWeight: 2)
+        XCTAssertGreaterThan(mesh.triangleCount, 500)
+        for p in mesh.positions { XCTAssertEqual(p.z, -0.5, accuracy: 0.002) }
+        var normal = SIMD3<Float>.zero
+        for t in 0..<mesh.triangleCount { normal += mesh.faceNormal(t) }
+        XCTAssertGreaterThan(normal.z / Float(mesh.triangleCount), 0.99)
+        XCTAssertEqual(mesh.colors.first, SIMD3(200, 100, 50))
+    }
+
+    func testUnderObservedVoxelsGiveNoSurface() {
+        let k = Intrinsics(fx: 40, fy: 40, cx: 20, cy: 20)
+        let image = DepthImage(width: 40, height: 40, depth: [Float](repeating: 0.5, count: 1600))
+        var volume = TSDFVolume(voxelSize: 0.01)
+        volume.integrate(depth: image, intrinsics: k, cameraToWorld: .identity, color: { _, _ in .zero })
+        XCTAssertTrue(volume.extractMesh(minWeight: 2).isEmpty)
+        XCTAssertFalse(volume.extractMesh(minWeight: 1).isEmpty)
+    }
+
+    func testFusedSphereFromFrontAndBack() {
+        let k = Intrinsics(fx: 100, fy: 100, cx: 32, cy: 32)
+        let image = sphereDepth(radius: 0.1, distance: 0.5, size: 64, intrinsics: k)
+        let front = RigidTransform.translation(SIMD3(0, 0, 0.5))
+        // Half a turn about +y, standing behind the sphere and looking along +z.
+        let back = RigidTransform(SIMD4(-1, 0, 0, 0), SIMD4(0, 1, 0, 0), SIMD4(0, 0, -1, 0), SIMD4(0, 0, -0.5, 1))
+        var volume = TSDFVolume(voxelSize: 0.005)
+        for pose in [front, back] {
+            for _ in 0..<2 {
+                volume.integrate(depth: image, intrinsics: k, cameraToWorld: pose,
+                                 options: .init(step: 1), color: { _, _ in SIMD3(1, 2, 3) })
+            }
+        }
+        let mesh = volume.extractMesh(minWeight: 2)
+        XCTAssertGreaterThan(mesh.triangleCount, 1000)
+        let onSurface = mesh.positions.filter { abs(vectorLength($0) - 0.1) < 0.01 }.count
+        XCTAssertGreaterThan(Double(onSurface) / Double(mesh.vertexCount), 0.9)
+        var outward = 0
+        for t in 0..<mesh.triangleCount {
+            let corner = mesh.positions[Int(mesh.indices[t * 3])]
+            if (mesh.faceNormal(t) * corner).sum() > 0 { outward += 1 }
+        }
+        XCTAssertGreaterThan(Double(outward) / Double(mesh.triangleCount), 0.9)
+        // Both halves are there.
+        XCTAssertTrue(mesh.positions.contains { $0.z > 0.09 })
+        XCTAssertTrue(mesh.positions.contains { $0.z < -0.09 })
+    }
 }
 
 final class HTTPTests: XCTestCase {

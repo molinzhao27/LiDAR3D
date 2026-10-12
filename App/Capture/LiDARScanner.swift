@@ -5,18 +5,19 @@ import ScanCore
 
 /// Rear LiDAR scanning for rooms, bodies, furniture and other larger objects.
 ///
-/// Two things are built at once while the user walks around the subject:
-/// - ARKit's own scene reconstruction supplies the triangle mesh (watertight-ish,
-///   a few centimetres resolution), shown live as a wireframe.
+/// Several things are built at once while the user walks around the subject:
 /// - Every few frames the LiDAR depth map is back-projected through the tracked
-///   camera pose into a coloured voxel cloud, which becomes the dense point
-///   cloud export and also colours and trims the mesh to the chosen range.
+///   camera pose into a coloured voxel cloud, which becomes the point cloud export.
+/// - The same frames are fused into a signed distance volume, from which the
+///   fine mesh export (down to 5 mm detail) is extracted when the scan ends.
+/// - ARKit's own scene reconstruction (a few centimetres resolution) is shown
+///   live as a wireframe, and is the fallback mesh if fusion finds no surface.
 final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
     struct Settings: Equatable {
         /// Depth beyond this is ignored, which crops the background away.
         var maxDistance: Float = 2.0
-        /// Edge length of the point-cloud voxels in metres.
-        var voxelSize: Float = 0.01
+        /// Edge length of the point-cloud and mesh voxels in metres.
+        var voxelSize: Float = 0.005
         /// Keep only high-confidence LiDAR samples (cleaner, slightly sparser).
         var highConfidenceOnly = true
     }
@@ -44,11 +45,19 @@ final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
     // Everything below is touched only on `queue`, which is also the ARSession
     // delegate queue, so frames are processed without hopping threads.
     private let queue = DispatchQueue(label: "facet.lidar", qos: .userInitiated)
-    private var cloud = VoxelCloud(voxelSize: 0.01)
+    private var cloud = VoxelCloud(voxelSize: 0.005)
     private var capturing = false
     private var lastIntegration: TimeInterval = 0
-    private var integration = VoxelCloud.IntegrationOptions(step: 2, minDepth: 0.15, maxDepth: 2.0, minConfidence: 2)
+    private var integration = VoxelCloud.IntegrationOptions(step: 1, minDepth: 0.15, maxDepth: 2.0, minConfidence: 2,
+                                                             maxNeighborJump: 0.04)
     private var lastHint: String?
+    private var meshBusy = false
+
+    // The mesh volume is fused on its own queue so a slow frame never holds up
+    // ARKit; frames that arrive while it's busy are left out of the mesh (they
+    // still go into the point cloud). `volume` is touched only on `meshQueue`.
+    private let meshQueue = DispatchQueue(label: "facet.lidar.mesh", qos: .userInitiated)
+    private var volume = TSDFVolume(voxelSize: 0.005)
 
     /// Integration rate. LiDAR depth is 60 Hz but neighbouring frames are near
     /// duplicates; ~6 Hz keeps the CPU cool and loses nothing.
@@ -93,6 +102,7 @@ final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
         queue.async {
             self.capturing = false
             self.cloud = VoxelCloud(voxelSize: voxelSize)
+            self.meshQueue.async { self.volume = TSDFVolume(voxelSize: voxelSize) }
             DispatchQueue.main.async { self.pointCount = 0 }
         }
         phase = .ready
@@ -111,6 +121,7 @@ final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
             // Voxel size can only change before anything is captured.
             if self.cloud.voxelCount == 0 && self.cloud.voxelSize != s.voxelSize {
                 self.cloud = VoxelCloud(voxelSize: s.voxelSize)
+                self.meshQueue.async { self.volume = TSDFVolume(voxelSize: s.voxelSize) }
             }
         }
     }
@@ -130,22 +141,45 @@ final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
 
     private func integrate(frame: ARFrame, sceneDepth: ARDepthData) {
         guard let depth = DepthImage(depthMap: sceneDepth.depthMap),
-              let colors = YCbCrSampler(frame.capturedImage) else { return }
-        defer { colors.unlock() }
+              let sampler = YCbCrSampler(frame.capturedImage) else { return }
         let confidence = sceneDepth.confidenceMap.map(copyBytes(of:))
 
         // ARKit's intrinsics are for the full-size colour image; the depth map
         // covers the same field of view at lower resolution.
-        let sx = Float(depth.width) / Float(colors.width)
-        let sy = Float(depth.height) / Float(colors.height)
+        let sx = Float(depth.width) / Float(sampler.width)
+        let sy = Float(depth.height) / Float(sampler.height)
         let intrinsics = Intrinsics(frame.camera.intrinsics).scaled(x: sx, y: sy)
-        let toColorX = Float(colors.width) / Float(depth.width)
-        let toColorY = Float(colors.height) / Float(depth.height)
+        let toColorX = Float(sampler.width) / Float(depth.width)
+        let toColorY = Float(sampler.height) / Float(depth.height)
+
+        // Colour at depth resolution, copied so the camera image is released
+        // before the mesh volume (on another queue) uses it.
+        let width = depth.width
+        var buffer = [SIMD3<UInt8>](repeating: .zero, count: width * depth.height)
+        for y in 0..<depth.height {
+            for x in 0..<width {
+                buffer[y * width + x] = sampler.rgb(x: Int((Float(x) + 0.5) * toColorX), y: Int((Float(y) + 0.5) * toColorY))
+            }
+        }
+        sampler.unlock()
+        let rgb = buffer
+        let color: ColorSampler = { x, y in rgb[y * width + x] }
+        let pose = RigidTransform(frame.camera.transform)
 
         cloud.integrate(depth: depth, confidence: confidence, intrinsics: intrinsics,
-                        cameraToWorld: RigidTransform(frame.camera.transform),
-                        options: integration) { x, y in
-            colors.rgb(x: Int((Float(x) + 0.5) * toColorX), y: Int((Float(y) + 0.5) * toColorY))
+                        cameraToWorld: pose, options: integration, color: color)
+
+        guard !meshBusy else { return }
+        meshBusy = true
+        // For the volume, step only thins the search for blocks near the surface.
+        let options = VoxelCloud.IntegrationOptions(step: 2, minDepth: integration.minDepth,
+                                                    maxDepth: integration.maxDepth,
+                                                    minConfidence: integration.minConfidence,
+                                                    maxNeighborJump: integration.maxNeighborJump)
+        meshQueue.async {
+            self.volume.integrate(depth: depth, confidence: confidence, intrinsics: intrinsics,
+                                  cameraToWorld: pose, options: options, color: color)
+            self.queue.async { self.meshBusy = false }
         }
     }
 
@@ -185,16 +219,25 @@ final class LiDARScanner: NSObject, ObservableObject, ARSessionDelegate {
         let result: Result? = await withCheckedContinuation { continuation in
             queue.async {
                 self.capturing = false
-                let points = self.cloud.pointCloud(minObservations: 2)
+                // Voxels seen fewer than three times are mostly sensor noise.
+                let points = self.cloud.pointCloud(minObservations: 3)
                 guard !points.isEmpty else {
                     continuation.resume(returning: nil)
                     return
                 }
-                // Colour the mesh from the cloud and drop parts never seen within range,
-                // then clear away small floating fragments.
-                let mesh = self.cloud.colorizeAndCrop(reconstructed, searchRadius: 2)
+                // Fallback: ARKit's coarse mesh, coloured from the cloud and trimmed
+                // to what was seen within range. It sits a centimetre or two off the
+                // depth samples, so the reach is in metres rather than voxels.
+                let coarse = self.cloud.colorizeAndCrop(reconstructed, maxDistance: 0.03)
                     .removingSmallComponents(minTriangles: 30)
-                continuation.resume(returning: Result(mesh: mesh, points: points))
+                // `meshQueue` is serial, so this runs after any fusion still in flight.
+                self.meshQueue.async {
+                    // Drop floating fragments smaller than about 20 cm².
+                    let voxel = self.volume.voxelSize
+                    let fused = self.volume.extractMesh(minWeight: 2)
+                        .removingSmallComponents(minTriangles: max(20, Int(0.004 / (voxel * voxel))))
+                    continuation.resume(returning: Result(mesh: fused.isEmpty ? coarse : fused, points: points))
+                }
             }
         }
         if result == nil { resumeAfterFailedFinish() }

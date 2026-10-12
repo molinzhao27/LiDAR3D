@@ -31,6 +31,20 @@ public struct DepthImage: Equatable {
     static func isValid(_ z: Float) -> Bool {
         z.isFinite && z > 0
     }
+
+    /// True when pixel (x, y) sits on a silhouette: a direct neighbour has no
+    /// depth, or differs from this pixel by more than `relativeJump` times its
+    /// depth. Neighbours outside the image don't count.
+    func isOnEdge(x: Int, y: Int, relativeJump: Float) -> Bool {
+        let z = self[x, y]
+        let limit = relativeJump * z
+        func differs(_ nx: Int, _ ny: Int) -> Bool {
+            guard nx >= 0, ny >= 0, nx < width, ny < height else { return false }
+            let n = self[nx, ny]
+            return !Self.isValid(n) || abs(n - z) > limit
+        }
+        return differs(x - 1, y) || differs(x + 1, y) || differs(x, y - 1) || differs(x, y + 1)
+    }
 }
 
 /// Supplies an sRGB colour for a pixel of the depth map.

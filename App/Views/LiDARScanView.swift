@@ -145,7 +145,7 @@ private struct LiDARSettingsView: View {
                     Text("Depth farther than this is ignored. Keep it short for objects so the background is cropped away.")
                 }
                 Section {
-                    Picker("Point spacing", selection: $settings.voxelSize) {
+                    Picker("Detail", selection: $settings.voxelSize) {
                         Text("5 mm").tag(Float(0.005))
                         Text("1 cm").tag(Float(0.01))
                         Text("2 cm").tag(Float(0.02))
@@ -153,8 +153,8 @@ private struct LiDARSettingsView: View {
                     .disabled(!canChangeDensity)
                     Toggle("High-confidence depth only", isOn: $settings.highConfidenceOnly)
                 } footer: {
-                    Text(canChangeDensity ? "Finer spacing gives denser point clouds and larger files."
-                                          : "Reset the scan to change point spacing.")
+                    Text(canChangeDensity ? "Size of the smallest detail in the mesh and the spacing of the points. 5 mm suits people and objects; use 2 cm for whole rooms."
+                                          : "Reset the scan to change the detail.")
                 }
             }
             .navigationTitle("Scan settings")
