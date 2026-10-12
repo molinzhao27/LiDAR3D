@@ -83,7 +83,7 @@ public struct TSDFVolume {
                 let p = cameraToWorld.apply(intrinsics.unproject(u: Float(x), v: Float(y), depth: image.depth[i]))
                 let ray = unitVector(p - camera)
                 for s in 0...bandSamples {
-                    let t = -truncation + 2 * truncation * Float(s) / Float(bandSamples)
+                    let t: Float = -truncation + 2 * truncation * Float(s) / Float(bandSamples)
                     if let key = blockKey(containing: p + ray * t) { touched.insert(key) }
                 }
             }
@@ -98,7 +98,7 @@ public struct TSDFVolume {
             let base = key &* Int32(Self.blockSide)
             for n in 0..<Self.voxelsPerBlock {
                 let g = base &+ SIMD3(Int32(n & 7), Int32((n >> 3) & 7), Int32(n >> 6))
-                let center = (SIMD3<Float>(Float(g.x), Float(g.y), Float(g.z)) + 0.5) * voxelSize
+                let center: SIMD3<Float> = Self.gridPoint(g, offset: .zero) * voxelSize
                 let c = worldToCamera.apply(center)
                 let zc = -c.z
                 guard zc >= options.minDepth else { continue }
@@ -122,7 +122,8 @@ public struct TSDFVolume {
                     let old = color[index]
                     let samples = Float(old.w)
                     func blend(_ a: UInt8, _ b: UInt8) -> UInt8 {
-                        UInt8(min(255, ((Float(a) * samples + Float(b)) / (samples + 1)).rounded()))
+                        let mean: Float = (Float(a) * samples + Float(b)) / (samples + 1)
+                        return clampedByte(mean)
                     }
                     color[index] = SIMD4(blend(old.x, rgb.x), blend(old.y, rgb.y), blend(old.z, rgb.z),
                                          min(old.w, 29) + 1)
@@ -212,7 +213,7 @@ public struct TSDFVolume {
     }
 
     private struct BlockCache {
-        var key = SIMD3<Int32>(.min, .min, .min)
+        var key = SIMD3<Int32>(repeating: .min)
         var block = -1
     }
 
@@ -255,11 +256,11 @@ public struct TSDFVolume {
         for (a, b) in Self.cellEdges {
             let va = corners.value[a], vb = corners.value[b]
             guard (va > 0) != (vb > 0), Self.isRealCrossing(va, vb) else { continue }
-            let t = va / (va - vb)
-            pointSum += Self.cornerPoint[a] + (Self.cornerPoint[b] - Self.cornerPoint[a]) * t
+            let t: Float = va / (va - vb)
+            pointSum += Self.lerp(Self.cornerPoint[a], Self.cornerPoint[b], t)
             crossings += 1
             switch (corners.hasColor[a], corners.hasColor[b]) {
-            case (true, true): colorSum += corners.color[a] + (corners.color[b] - corners.color[a]) * t
+            case (true, true): colorSum += Self.lerp(corners.color[a], corners.color[b], t)
             case (true, false): colorSum += corners.color[a]
             case (false, true): colorSum += corners.color[b]
             case (false, false): continue
@@ -268,20 +269,36 @@ public struct TSDFVolume {
         }
         guard crossings > 0 else { return nil }
 
-        let local = pointSum / Float(crossings)
-        let position = (SIMD3<Float>(Float(cell.x), Float(cell.y), Float(cell.z)) + 0.5 + local) * voxelSize
+        let local: SIMD3<Float> = pointSum / Float(crossings)
+        let position: SIMD3<Float> = Self.gridPoint(cell, offset: local) * voxelSize
         guard colorCount > 0 else { return (position, SIMD3(128, 128, 128)) }
-        let c = colorSum / Float(colorCount)
-        return (position, SIMD3(UInt8(min(max(c.x.rounded(), 0), 255)),
-                                UInt8(min(max(c.y.rounded(), 0), 255)),
-                                UInt8(min(max(c.z.rounded(), 0), 255))))
+        let c: SIMD3<Float> = colorSum / Float(colorCount)
+        return (position, SIMD3(clampedByte(c.x), clampedByte(c.y), clampedByte(c.z)))
+    }
+
+    /// Voxel centre of grid coordinate `g`, plus `offset`, in voxel units.
+    @inline(__always)
+    private static func gridPoint(_ g: SIMD3<Int32>, offset: SIMD3<Float>) -> SIMD3<Float> {
+        let corner = SIMD3<Float>(Float(g.x), Float(g.y), Float(g.z))
+        let half = SIMD3<Float>(repeating: 0.5)
+        return corner + half + offset
+    }
+
+    @inline(__always)
+    private static func lerp(_ a: SIMD3<Float>, _ b: SIMD3<Float>, _ t: Float) -> SIMD3<Float> {
+        let delta: SIMD3<Float> = b - a
+        return a + delta * t
     }
 
     /// Cell corner k sits at bit 0 → +x, bit 1 → +y, bit 2 → +z from the cell origin.
-    private static let cornerOffset: [SIMD3<Int32>] = (0..<8).map {
-        SIMD3(Int32($0 & 1), Int32(($0 >> 1) & 1), Int32(($0 >> 2) & 1))
-    }
-    private static let cornerPoint: [SIMD3<Float>] = cornerOffset.map { SIMD3(Float($0.x), Float($0.y), Float($0.z)) }
+    private static let cornerOffset: [SIMD3<Int32>] = [
+        SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0),
+        SIMD3(0, 0, 1), SIMD3(1, 0, 1), SIMD3(0, 1, 1), SIMD3(1, 1, 1),
+    ]
+    private static let cornerPoint: [SIMD3<Float>] = [
+        SIMD3(0, 0, 0), SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(1, 1, 0),
+        SIMD3(0, 0, 1), SIMD3(1, 0, 1), SIMD3(0, 1, 1), SIMD3(1, 1, 1),
+    ]
     /// The 12 cell edges as pairs of corners that differ in one axis.
     private static let cellEdges: [(Int, Int)] = {
         var edges: [(Int, Int)] = []
@@ -291,4 +308,9 @@ public struct TSDFVolume {
         return edges
     }()
     private static let unit: [SIMD3<Int32>] = [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)]
+}
+
+@inline(__always)
+private func clampedByte(_ v: Float) -> UInt8 {
+    UInt8(Swift.min(Swift.max(v.rounded(), 0), 255))
 }
