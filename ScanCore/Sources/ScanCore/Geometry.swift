@@ -78,6 +78,17 @@ public struct RigidTransform: Equatable {
         let r = c0 * d.x + c1 * d.y + c2 * d.z
         return SIMD3(r.x, r.y, r.z)
     }
+
+    /// Where the transformed frame's origin lands (e.g. the camera position).
+    public var origin: SIMD3<Float> { SIMD3(c3.x, c3.y, c3.z) }
+
+    /// The inverse, assuming the transform is a rotation plus a translation.
+    public var inverse: RigidTransform {
+        let x = SIMD3(c0.x, c0.y, c0.z), y = SIMD3(c1.x, c1.y, c1.z), z = SIMD3(c2.x, c2.y, c2.z)
+        let t = origin
+        return RigidTransform(SIMD4(c0.x, c1.x, c2.x, 0), SIMD4(c0.y, c1.y, c2.y, 0), SIMD4(c0.z, c1.z, c2.z, 0),
+                              SIMD4(-(x * t).sum(), -(y * t).sum(), -(z * t).sum(), 1))
+    }
 }
 
 @inline(__always)
